@@ -996,6 +996,7 @@
           stopRecordTimer();
           mediaRecorder = null;
           recordedChunks = [];
+          stopMicTracks();
         }
         running = false;
         starting = false;
@@ -1232,6 +1233,8 @@
       var holdTimer = 0;
       var holdTriggered = false;
       var shutterArmed = false;
+      var micStream = null;
+      var recordStream = null;
 
       function setCaptureMode(mode) {
         captureMode = mode === 'video' ? 'video' : 'photo';
@@ -1252,9 +1255,10 @@
 
       function pickRecorderMime() {
         var types = [
-          'video/mp4;codecs=avc1',
+          'video/mp4;codecs=avc1,mp4a.40.2',
           'video/mp4',
           'video/webm;codecs=vp9,opus',
+          'video/webm;codecs=vp8,opus',
           'video/webm;codecs=vp8',
           'video/webm'
         ];
@@ -1263,6 +1267,37 @@
           if (MediaRecorder.isTypeSupported(types[i])) return types[i];
         }
         return '';
+      }
+
+      function stopMicTracks() {
+        if (micStream) {
+          micStream.getTracks().forEach(function (t) { t.stop(); });
+          micStream = null;
+        }
+        if (recordStream) {
+          // Don't stop canvas-derived video tracks harshly; just drop reference.
+          // Mic tracks already stopped above if they were added from micStream.
+          recordStream.getAudioTracks().forEach(function (t) {
+            try { t.stop(); } catch (e) { /* ignore */ }
+          });
+          recordStream = null;
+        }
+      }
+
+      async function getMicStream() {
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            },
+            video: false
+          });
+        } catch (err) {
+          console.warn('Mic permission failed', err);
+          return null;
+        }
       }
 
       async function shareFile(file, successMsg) {
@@ -1353,14 +1388,38 @@
           return;
         }
 
+        // Merge canvas video + microphone audio
+        stopMicTracks();
+        micStream = await getMicStream();
+        recordStream = new MediaStream();
+        canvasStream.getVideoTracks().forEach(function (t) {
+          recordStream.addTrack(t);
+        });
+
+        var hasAudio = false;
+        if (micStream) {
+          micStream.getAudioTracks().forEach(function (t) {
+            recordStream.addTrack(t);
+            hasAudio = true;
+          });
+        }
+
+        if (!hasAudio) {
+          toastTemp('Mic unavailable — recording video only', 1600);
+        }
+
         try {
-          mediaRecorder = mime
-            ? new MediaRecorder(canvasStream, { mimeType: mime, videoBitsPerSecond: 6000000 })
-            : new MediaRecorder(canvasStream);
+          var opts = { videoBitsPerSecond: 6000000 };
+          if (mime) opts.mimeType = mime;
+          if (hasAudio) opts.audioBitsPerSecond = 128000;
+          mediaRecorder = new MediaRecorder(recordStream, opts);
         } catch (err) {
           try {
-            mediaRecorder = new MediaRecorder(canvasStream);
+            mediaRecorder = mime
+              ? new MediaRecorder(recordStream, { mimeType: mime })
+              : new MediaRecorder(recordStream);
           } catch (err2) {
+            stopMicTracks();
             toast('Could not start recorder', true);
             return;
           }
@@ -1382,6 +1441,7 @@
         try {
           mediaRecorder.start(250);
         } catch (err) {
+          stopMicTracks();
           toast('Could not start recording', true);
           return;
         }
@@ -1389,7 +1449,7 @@
         recording = true;
         document.body.classList.add('is-recording');
         startRecordTimer();
-        toastTemp('Recording…', 900);
+        toastTemp(hasAudio ? 'Recording with mic…' : 'Recording…', 900);
       }
 
       function requestStopRecording() {
@@ -1402,7 +1462,10 @@
       }
 
       async function finishRecording(aborted) {
-        if (!recording && !mediaRecorder) return;
+        if (!recording && !mediaRecorder) {
+          stopMicTracks();
+          return;
+        }
         recording = false;
         document.body.classList.remove('is-recording');
         stopRecordTimer();
@@ -1411,6 +1474,7 @@
         var mime = (mediaRecorder && mediaRecorder.mimeType) || 'video/mp4';
         mediaRecorder = null;
         recordedChunks = [];
+        stopMicTracks();
 
         if (aborted || !chunks.length) {
           toastTemp('Recording cancelled', 1200);
